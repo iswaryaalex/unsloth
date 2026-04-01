@@ -16,6 +16,10 @@ sed -n '/^get_torch_index_url()/,/^}/p' "$INSTALL_SH" \
     | sed "s|/usr/bin/nvidia-smi|$_FAKE_SMI_DIR/nvidia-smi-absent|g" \
     > "$_FUNC_FILE"
 
+# Extract get_radeon_wheel_url function from install.sh
+_RADEON_FUNC_FILE=$(mktemp)
+sed -n '/^get_radeon_wheel_url()/,/^}/p' "$INSTALL_SH" > "$_RADEON_FUNC_FILE"
+
 # Save system PATH so we always have basic tools (uname, grep, head, etc.)
 _SYS_PATH="/usr/local/bin:/usr/bin:/bin"
 
@@ -246,6 +250,84 @@ rm -rf "$_dir"
 rm -f "$_FUNC_FILE"
 rm -rf "$_FAKE_SMI_DIR"
 rm -rf "$_TOOLS_DIR"
+
+echo ""
+echo "=== test_get_radeon_wheel_url ==="
+
+# Helper: run get_radeon_wheel_url with a custom PATH and optional /opt/rocm mock
+run_radeon_func() {
+    _mock_dir="$1"
+    _rocm_ver_file="${2:-}"  # optional: path to a mock /opt/rocm/.info/version file
+    _env_overrides=""
+    if [ -n "$_rocm_ver_file" ]; then
+        # We can't override /opt/rocm directly, so we inject via a wrapper that
+        # sets the file path in the awk call -- instead we use a tmp dir and
+        # rewrite the function's reference (see approach below)
+        :
+    fi
+    # Run on Linux uname; macOS short-circuits to empty
+    if [ "$_mock_dir" = "none" ]; then
+        PATH="$_TOOLS_DIR" bash -c ". '$_RADEON_FUNC_FILE'; get_radeon_wheel_url" 2>/dev/null
+    else
+        PATH="$_mock_dir:$_TOOLS_DIR" bash -c ". '$_RADEON_FUNC_FILE'; get_radeon_wheel_url" 2>/dev/null
+    fi
+}
+
+# Helper: make a mock amd-smi returning an X.Y.Z version string
+make_mock_amd_smi_xyz() {
+    _dir=$(mktemp -d)
+    cat > "$_dir/amd-smi" <<MOCK
+#!/bin/sh
+case "\$1" in
+    list) printf 'GPU: 0\n  BDF: 0000:03:00.0\n  NAME: gfx1100\n' ;;
+    *)    printf 'AMDSMI Tool: 25.0.1 | AMDSMI Library version: 25.0.1.0 | ROCm version: $1\n' ;;
+esac
+MOCK
+    chmod +x "$_dir/amd-smi"
+    echo "$_dir"
+}
+
+# On Linux: amd-smi returns "7.2.1" -> expect rocm-rel-7.2.1
+if [ "$(uname -s)" = "Linux" ]; then
+    _dir=$(make_mock_amd_smi_xyz "7.2.1")
+    _result=$(run_radeon_func "$_dir")
+    assert_eq "radeon: amd-smi 7.2.1 -> rocm-rel-7.2.1" \
+        "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/" "$_result"
+    rm -rf "$_dir"
+
+    # amd-smi returns "7.1.3"
+    _dir=$(make_mock_amd_smi_xyz "7.1.3")
+    _result=$(run_radeon_func "$_dir")
+    assert_eq "radeon: amd-smi 7.1.3 -> rocm-rel-7.1.3" \
+        "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.1.3/" "$_result"
+    rm -rf "$_dir"
+
+    # amd-smi absent + /opt/rocm/.info/version fallback
+    # We test via a minimal tool dir with no amd-smi but a real version file
+    _tmp_rocm=$(mktemp -d)
+    mkdir -p "$_tmp_rocm/.info"
+    printf '6.3.1-12345\n' > "$_tmp_rocm/.info/version"
+    # Rewrite /opt/rocm path in function to point at tmp dir
+    _patched=$(mktemp)
+    sed "s|/opt/rocm/.info/version|$_tmp_rocm/.info/version|g" "$_RADEON_FUNC_FILE" > "$_patched"
+    _result=$(PATH="$_TOOLS_DIR" bash -c ". '$_patched'; get_radeon_wheel_url" 2>/dev/null)
+    assert_eq "radeon: version file 6.3.1 -> rocm-rel-6.3.1" \
+        "https://repo.radeon.com/rocm/manylinux/rocm-rel-6.3.1/" "$_result"
+    rm -rf "$_tmp_rocm"
+    rm -f "$_patched"
+
+    # No version source at all -> empty string
+    _result=$(run_radeon_func "none")
+    assert_eq "radeon: no version source -> empty" "" "$_result"
+else
+    # macOS: function must return empty
+    _dir=$(make_mock_amd_smi_xyz "7.2.1")
+    _result=$(run_radeon_func "$_dir")
+    assert_eq "radeon: macOS -> empty" "" "$_result"
+    rm -rf "$_dir"
+fi
+
+rm -f "$_RADEON_FUNC_FILE"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

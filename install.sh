@@ -38,6 +38,7 @@ PACKAGE_NAME="unsloth"
 _USER_PYTHON=""
 _NO_TORCH_FLAG=false
 _VERBOSE=false
+RADEON=false
 _next_is_package=false
 _next_is_python=false
 for arg in "$@"; do
@@ -56,6 +57,7 @@ for arg in "$@"; do
         --package) _next_is_package=true ;;
         --python) _next_is_python=true ;;
         --no-torch) _NO_TORCH_FLAG=true ;;
+        --radeon) RADEON=true ;;
         --verbose|-v) _VERBOSE=true ;;
     esac
 done
@@ -1055,6 +1057,31 @@ get_torch_index_url() {
     elif [ "$_major" -ge 11 ]; then echo "$_base/cu118"
     else echo "$_base/cpu"; fi
 }
+
+get_radeon_wheel_url() {
+    # Only meaningful on Linux. Returns the repo.radeon.com --find-links URL
+    # for the detected ROCm full version (X.Y.Z), or empty string on failure.
+    case "$(uname -s)" in Linux) ;; *) echo ""; return ;; esac
+
+    # Detect full X.Y.Z version -- try amd-smi first, then /opt/rocm/.info/version, then hipconfig
+    _full_ver=""
+    _full_ver=$({ command -v amd-smi >/dev/null 2>&1 && \
+        amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
+            'NF>1{gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]/) \
+            {print $2; ok=1; exit}} END{exit !ok}'; } || \
+        { [ -r /opt/rocm/.info/version ] && \
+            awk -F'[.-]' 'NF>=3{print $1"."$2"."$3; exit}' /opt/rocm/.info/version; } || \
+        { command -v hipconfig >/dev/null 2>&1 && \
+            hipconfig --version 2>/dev/null | awk 'NR==1 && /^[0-9]+\.[0-9]+\.[0-9]/{print $1}'; }) 2>/dev/null
+
+    # Validate: must be X.Y.Z with X >= 1
+    case "$_full_ver" in
+        [1-9]*.*[0-9].*[0-9]*) : ;;
+        *) echo ""; return ;;
+    esac
+    echo "https://repo.radeon.com/rocm/manylinux/rocm-rel-${_full_ver}/"
+}
+
 TORCH_INDEX_URL=$(get_torch_index_url)
 
 # ── Print CPU-only hint when no GPU detected ──
@@ -1108,6 +1135,27 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     # Fresh: Step 1 - install torch from explicit index (skip when --no-torch or Intel Mac)
     if [ "$SKIP_TORCH" = true ]; then
         substep "skipping PyTorch (--no-torch or Intel Mac x86_64)." "$C_WARN"
+    elif [ "$RADEON" = true ]; then
+        _radeon_url=$(get_radeon_wheel_url)
+        if [ -n "$_radeon_url" ]; then
+            substep "installing PyTorch from Radeon repo (${_radeon_url})..."
+            run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
+                torch torchvision torchaudio \
+                --find-links "$_radeon_url"
+            substep "installing bitsandbytes for AMD Radeon..."
+            run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" \
+                "bitsandbytes>=0.49.1"
+        else
+            substep "[WARN] --radeon: could not detect full ROCm version for Radeon repo; falling back to pytorch.org" "$C_WARN"
+            run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" "torch>=2.4,<2.11.0" "torchvision<0.26.0" "torchaudio<2.11.0" \
+                --index-url "$TORCH_INDEX_URL"
+            case "$TORCH_INDEX_URL" in
+                */rocm*)
+                    substep "installing bitsandbytes for AMD ROCm..."
+                    run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" "bitsandbytes>=0.49.1"
+                    ;;
+            esac
+        fi
     else
         substep "installing PyTorch ($TORCH_INDEX_URL)..."
         run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" "torch>=2.4,<2.11.0" "torchvision<0.26.0" "torchaudio<2.11.0" \

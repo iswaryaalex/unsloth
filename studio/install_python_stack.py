@@ -84,6 +84,47 @@ def _detect_rocm_version() -> tuple[int, int] | None:
     return None
 
 
+def _detect_rocm_patch() -> int:
+    """Return the patch number of the installed ROCm (third component), or 0."""
+    rocm_root = os.environ.get("ROCM_PATH") or "/opt/rocm"
+    for path in (
+        os.path.join(rocm_root, ".info", "version"),
+        os.path.join(rocm_root, "lib", "rocm_version"),
+    ):
+        try:
+            with open(path) as fh:
+                parts = fh.read().strip().split("-")[0].split(".")
+            return int(parts[2]) if len(parts) >= 3 else 0
+        except Exception:
+            pass
+    # Try hipconfig -- outputs "X.Y.Z.build" or "X.Y.Z"
+    hipconfig = shutil.which("hipconfig")
+    if hipconfig:
+        try:
+            result = subprocess.run(
+                [hipconfig, "--version"],
+                stdout = subprocess.PIPE,
+                stderr = subprocess.DEVNULL,
+                timeout = 5,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.decode().strip().split("\n")[0].split(".")
+                if len(parts) >= 3:
+                    return int(parts[2].split("-")[0])
+        except Exception:
+            pass
+    return 0
+
+
+def _radeon_wheel_url(major: int, minor: int, patch: int) -> str:
+    """Build the repo.radeon.com --find-links URL for the given ROCm X.Y.Z."""
+    if platform.system() == "Windows":
+        base = "https://repo.radeon.com/rocm/windows"
+    else:
+        base = "https://repo.radeon.com/rocm/manylinux"
+    return f"{base}/rocm-rel-{major}.{minor}.{patch}/"
+
+
 def _has_rocm_gpu() -> bool:
     """Return True only if an actual AMD GPU is visible (not just ROCm tools installed)."""
     for cmd, marker in (
@@ -217,6 +258,7 @@ def _infer_no_torch() -> bool:
 
 
 NO_TORCH = _infer_no_torch()
+RADEON: bool = "--radeon" in sys.argv
 
 # -- Verbosity control ----------------------------------------------------------
 # By default the installer shows a minimal progress bar (one line, in-place).
@@ -721,7 +763,33 @@ def install_python_stack() -> int:
     #     Must come immediately after base packages so torch is present for inspection.
     if not IS_WINDOWS and not IS_MACOS and not NO_TORCH:
         _progress("ROCm torch check")
-        _ensure_rocm_torch()
+        if RADEON:
+            ver = _detect_rocm_version()
+            if ver:
+                patch = _detect_rocm_patch()
+                radeon_url = _radeon_wheel_url(ver[0], ver[1], patch)
+                _safe_print(_dim("  Radeon repo:"), radeon_url)
+                pip_install(
+                    f"Radeon torch ({ver[0]}.{ver[1]}.{patch})",
+                    "--no-cache-dir",
+                    "torch", "torchvision", "torchaudio",
+                    "--find-links", radeon_url,
+                    constrain = False,
+                )
+                pip_install(
+                    "bitsandbytes (AMD)",
+                    "--no-cache-dir",
+                    "bitsandbytes>=0.49.1",
+                    constrain = False,
+                )
+            else:
+                _safe_print(
+                    _dim("  [WARN]"),
+                    "--radeon: could not detect ROCm version; falling back to pytorch.org",
+                )
+                _ensure_rocm_torch()
+        else:
+            _ensure_rocm_torch()
 
     # Windows + AMD GPU: PyTorch does not publish ROCm wheels for Windows.
     # Detect and warn so users know manual steps are needed for GPU training.

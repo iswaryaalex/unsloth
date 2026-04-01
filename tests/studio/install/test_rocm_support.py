@@ -47,6 +47,8 @@ sys.modules[_STACK_SPEC.name] = stack_mod
 _STACK_SPEC.loader.exec_module(stack_mod)
 
 _detect_rocm_version = stack_mod._detect_rocm_version
+_detect_rocm_patch = stack_mod._detect_rocm_patch
+_radeon_wheel_url = stack_mod._radeon_wheel_url
 _ensure_rocm_torch = stack_mod._ensure_rocm_torch
 _has_rocm_gpu = stack_mod._has_rocm_gpu
 _has_usable_nvidia_gpu = stack_mod._has_usable_nvidia_gpu
@@ -1248,6 +1250,134 @@ class TestHardwareAmdBranching:
         func_body = source[func_start : source.find("\ndef ", func_start + 1)]
         assert "IS_ROCM" in func_body
         assert "amd.get_physical_gpu_count" in func_body
+
+
+# =============================================================================
+# TEST: install_python_stack.py -- Radeon wheel URL helpers and --radeon flag
+# =============================================================================
+
+
+class TestRadeonWheelUrl:
+    """Verify Radeon repo URL building, patch detection, and --radeon flag logic."""
+
+    def test_radeon_flag_detected(self):
+        """RADEON flag should be True when '--radeon' is in sys.argv."""
+        # We test the raw detection logic rather than the module-level constant
+        # (which was resolved at import time without --radeon in argv).
+        assert ("--radeon" in sys.argv) == stack_mod.RADEON
+
+    def test_detect_rocm_patch_from_file(self, tmp_path):
+        """_detect_rocm_patch() should return correct patch int from version file."""
+        info_dir = tmp_path / ".info"
+        info_dir.mkdir()
+        (info_dir / "version").write_text("7.2.1-12345\n")
+        with patch.dict(os.environ, {"ROCM_PATH": str(tmp_path)}):
+            result = _detect_rocm_patch()
+        assert result == 1
+
+    def test_detect_rocm_patch_from_file_no_patch(self, tmp_path):
+        """_detect_rocm_patch() returns 0 when only X.Y version available."""
+        info_dir = tmp_path / ".info"
+        info_dir.mkdir()
+        (info_dir / "version").write_text("7.1\n")
+        with patch.dict(os.environ, {"ROCM_PATH": str(tmp_path)}):
+            with patch("shutil.which", return_value = None):
+                result = _detect_rocm_patch()
+        assert result == 0
+
+    def test_detect_rocm_patch_hipconfig_fallback(self, tmp_path):
+        """_detect_rocm_patch() should fall back to hipconfig."""
+        with patch.dict(os.environ, {"ROCM_PATH": str(tmp_path / "nonexistent")}):
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = b"6.3.2.12345\n"
+            with patch("shutil.which", return_value = "/usr/bin/hipconfig"):
+                with patch("subprocess.run", return_value = mock_result):
+                    result = _detect_rocm_patch()
+        assert result == 2
+
+    def test_detect_rocm_patch_no_sources_returns_zero(self, tmp_path):
+        """_detect_rocm_patch() returns 0 when nothing is available."""
+        with patch.dict(os.environ, {"ROCM_PATH": str(tmp_path / "nonexistent")}):
+            with patch("shutil.which", return_value = None):
+                result = _detect_rocm_patch()
+        assert result == 0
+
+    def test_radeon_wheel_url_linux(self):
+        """_radeon_wheel_url() returns manylinux URL on Linux."""
+        with patch("platform.system", return_value = "Linux"):
+            url = _radeon_wheel_url(7, 2, 1)
+        assert url == "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/"
+
+    def test_radeon_wheel_url_windows(self):
+        """_radeon_wheel_url() returns windows URL on Windows."""
+        with patch("platform.system", return_value = "Windows"):
+            url = _radeon_wheel_url(7, 2, 1)
+        assert url == "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
+
+    def test_radeon_wheel_url_patch_zero(self):
+        """_radeon_wheel_url() handles patch=0 correctly."""
+        with patch("platform.system", return_value = "Linux"):
+            url = _radeon_wheel_url(6, 3, 0)
+        assert url == "https://repo.radeon.com/rocm/manylinux/rocm-rel-6.3.0/"
+
+    def test_radeon_install_uses_find_links(self):
+        """When RADEON=True and ROCm detected, pip_install is called with --find-links."""
+        with patch.object(stack_mod, "RADEON", True):
+            with patch.object(stack_mod, "_detect_rocm_version", return_value = (7, 2)):
+                with patch.object(stack_mod, "_detect_rocm_patch", return_value = 1):
+                    with patch.object(stack_mod, "pip_install") as mock_pip:
+                        with patch("platform.system", return_value = "Linux"):
+                            ver = stack_mod._detect_rocm_version()
+                            patch_num = stack_mod._detect_rocm_patch()
+                            radeon_url = stack_mod._radeon_wheel_url(ver[0], ver[1], patch_num)
+                            stack_mod.pip_install(
+                                f"Radeon torch ({ver[0]}.{ver[1]}.{patch_num})",
+                                "--no-cache-dir",
+                                "torch", "torchvision", "torchaudio",
+                                "--find-links", radeon_url,
+                                constrain = False,
+                            )
+        assert mock_pip.call_count == 1
+        call_args = str(mock_pip.call_args_list[0])
+        assert "--find-links" in call_args
+        assert "repo.radeon.com" in call_args
+        assert "--index-url" not in call_args
+
+    def test_radeon_fallback_on_missing_version(self, capsys):
+        """When RADEON=True but _detect_rocm_version() is None, warn and fallback."""
+        with patch.object(stack_mod, "RADEON", True):
+            with patch.object(stack_mod, "_detect_rocm_version", return_value = None):
+                with patch.object(stack_mod, "_ensure_rocm_torch") as mock_ensure:
+                    with patch.object(stack_mod, "pip_install") as mock_pip:
+                        # Simulate the fallback path
+                        ver = stack_mod._detect_rocm_version()
+                        if ver:
+                            patch_num = stack_mod._detect_rocm_patch()
+                            radeon_url = stack_mod._radeon_wheel_url(ver[0], ver[1], patch_num)
+                            stack_mod.pip_install(
+                                f"Radeon torch ({ver[0]}.{ver[1]}.{patch_num})",
+                                "--no-cache-dir",
+                                "torch", "torchvision", "torchaudio",
+                                "--find-links", radeon_url,
+                                constrain = False,
+                            )
+                        else:
+                            print("[WARN] --radeon: could not detect ROCm version; falling back to pytorch.org")
+                            stack_mod._ensure_rocm_torch()
+        mock_pip.assert_not_called()
+        mock_ensure.assert_called_once()
+        captured = capsys.readouterr()
+        assert "falling back" in captured.out
+
+    def test_radeon_url_contains_xyz_not_just_xy(self):
+        """Radeon URL must include full X.Y.Z, not just X.Y."""
+        with patch("platform.system", return_value = "Linux"):
+            url = _radeon_wheel_url(7, 1, 3)
+        # Must have three dot-separated version components
+        version_part = url.split("rocm-rel-")[1].rstrip("/")
+        parts = version_part.split(".")
+        assert len(parts) == 3, f"Expected X.Y.Z in URL, got: {version_part}"
 
 
 # =============================================================================

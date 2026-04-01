@@ -13,11 +13,13 @@ function Install-UnslothStudio {
     $PackageName = "unsloth"
     $RepoRoot = ""
     $SkipTorch = $false
+    $Radeon = $false
     $argList = $args
     for ($i = 0; $i -lt $argList.Count; $i++) {
         switch ($argList[$i]) {
             "--local"    { $StudioLocalInstall = $true }
             "--no-torch" { $SkipTorch = $true }
+            "--radeon"   { $Radeon = $true }
             "--verbose"  { $script:UnslothVerbose = $true }
             "-v"         { $script:UnslothVerbose = $true }
             "--package"  {
@@ -774,6 +776,20 @@ shell.Run cmd, 0, False
     }
     $TorchIndexUrl = Get-TorchIndexUrl
 
+    function Get-RadeonWheelUrl {
+        # Detect full ROCm X.Y.Z version on Windows via amd-smi
+        $AmdSmiExe = Get-Command "amd-smi" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+        if (-not $AmdSmiExe) { return "" }
+        try {
+            $output = & $AmdSmiExe version 2>&1 | Out-String
+            if ($output -match 'ROCm version:\s*([\d]+\.[\d]+\.[\d]+)') {
+                $ver = $Matches[1]
+                return "https://repo.radeon.com/rocm/windows/rocm-rel-$ver/"
+            }
+        } catch {}
+        return ""
+    }
+
     # ── Print CPU-only hint when no GPU detected ──
     if (-not $SkipTorch -and $TorchIndexUrl -like "*/cpu") {
         Write-Host ""
@@ -845,6 +861,28 @@ shell.Run cmd, 0, False
     } elseif ($TorchIndexUrl) {
         if ($SkipTorch) {
             substep "skipping PyTorch (--no-torch flag set)." "Yellow"
+        } elseif ($Radeon) {
+            $RadeonUrl = Get-RadeonWheelUrl
+            if ($RadeonUrl) {
+                substep "Installing PyTorch from Radeon repo ($RadeonUrl)..."
+                $torchInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython torch torchvision torchaudio --find-links $RadeonUrl }
+                if ($torchInstallExit -ne 0) {
+                    Write-Host "[ERROR] Failed to install PyTorch from Radeon repo (exit code $torchInstallExit)" -ForegroundColor Red
+                    return
+                }
+                $torchInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython "bitsandbytes>=0.49.1" }
+                if ($torchInstallExit -ne 0) {
+                    Write-Host "[ERROR] Failed to install bitsandbytes (exit code $torchInstallExit)" -ForegroundColor Red
+                    return
+                }
+            } else {
+                substep "WARNING: --radeon: could not detect ROCm version; falling back to pytorch.org" "Yellow"
+                $torchInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" torchvision torchaudio --index-url $TorchIndexUrl }
+                if ($torchInstallExit -ne 0) {
+                    Write-Host "[ERROR] Failed to install PyTorch (exit code $torchInstallExit)" -ForegroundColor Red
+                    return
+                }
+            }
         } else {
             substep "installing PyTorch ($TorchIndexUrl)..."
             $torchInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" torchvision torchaudio --index-url $TorchIndexUrl }

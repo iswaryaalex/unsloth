@@ -1223,9 +1223,9 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             substep "    torchaudio:  $(basename "${_ta_whl:-"(not found -- using name)"}")"
             substep "    triton:      $(basename "${_tri_whl:-"(not found -- skipping)"}")"
             if [ -n "$_tri_arg" ]; then
-                run_install_cmd "install PyTorch + triton" uv pip install --python "$_VENV_PY" \
+                run_install_cmd "install triton + PyTorch" uv pip install --python "$_VENV_PY" \
                     --no-index --find-links "$_radeon_url" \
-                    "$_torch_arg" "$_tv_arg" "$_ta_arg" "$_tri_arg"
+                    "$_tri_arg" "$_torch_arg" "$_tv_arg" "$_ta_arg"
             else
                 run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
                     --no-index --find-links "$_radeon_url" \

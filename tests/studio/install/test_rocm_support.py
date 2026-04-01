@@ -1084,7 +1084,7 @@ class TestAmdGpuMonitoring:
         assert "def get_visible_gpu_utilization" in source
 
     def test_amd_smi_json_parsing(self):
-        """Verify _extract_gpu_metrics parses amd-smi JSON correctly."""
+        """Verify _extract_gpu_metrics parses rocm-smi JSON correctly."""
         amd_path = PACKAGE_ROOT / "studio" / "backend" / "utils" / "hardware" / "amd.py"
         _amd_spec = importlib.util.spec_from_file_location("test_amd", amd_path)
         assert _amd_spec is not None and _amd_spec.loader is not None
@@ -1098,18 +1098,14 @@ class TestAmdGpuMonitoring:
         except Exception:
             pytest.skip("Could not load amd module in test environment")
 
-        # Simulate amd-smi metric JSON output
+        # Simulate rocm-smi --json flat card entry (bytes for VRAM)
         gpu_data = {
-            "usage": {"gfx_activity": "85"},
-            "temperature": {"edge": "72"},
-            "power": {
-                "current_socket_power": "200.5",
-                "power_cap": "300",
-            },
-            "vram": {
-                "vram_used": 8192,  # MB
-                "vram_total": 16384,  # MB
-            },
+            "GPU use (%)": "85",
+            "Temperature (Sensor edge) (C)": "72.0",
+            "Average Graphics Package Power (W)": "200.5",
+            "Max Graphics Package Power (W)": "300.0",
+            "VRAM Total Memory (B)": str(16384 * 1024 * 1024),
+            "VRAM Total Used Memory (B)": str(8192 * 1024 * 1024),
         }
         metrics = amd_mod._extract_gpu_metrics(gpu_data)
         assert metrics["gpu_utilization_pct"] == 85.0
@@ -1122,7 +1118,7 @@ class TestAmdGpuMonitoring:
         assert metrics["power_utilization_pct"] is not None
 
     def test_amd_primary_gpu_with_mock(self):
-        """get_primary_gpu_utilization returns correct dict with mocked amd-smi."""
+        """get_primary_gpu_utilization returns correct dict with mocked rocm-smi."""
         amd_path = PACKAGE_ROOT / "studio" / "backend" / "utils" / "hardware" / "amd.py"
         _amd_spec = importlib.util.spec_from_file_location("test_amd2", amd_path)
         assert _amd_spec is not None and _amd_spec.loader is not None
@@ -1136,15 +1132,19 @@ class TestAmdGpuMonitoring:
         except Exception:
             pytest.skip("Could not load amd module")
 
+        # rocm-smi --json emits a card-keyed dict; "system" key is ignored
         mock_json = json.dumps(
-            [
-                {
-                    "usage": {"gfx_activity": "50"},
-                    "temperature": {"edge": "65"},
-                    "power": {"current_socket_power": "150", "power_cap": "250"},
-                    "vram": {"vram_used": 4096, "vram_total": 16384},
-                }
-            ]
+            {
+                "card0": {
+                    "GPU use (%)": "50",
+                    "Temperature (Sensor edge) (C)": "65.0",
+                    "Average Graphics Package Power (W)": "150",
+                    "Max Graphics Package Power (W)": "250",
+                    "VRAM Total Memory (B)": str(16384 * 1024 * 1024),
+                    "VRAM Total Used Memory (B)": str(4096 * 1024 * 1024),
+                },
+                "system": {"driver_version": "6.18"},
+            }
         )
         mock_result = MagicMock()
         mock_result.returncode = 0
@@ -1157,7 +1157,7 @@ class TestAmdGpuMonitoring:
         assert result["temperature_c"] == 65.0
 
     def test_amd_smi_not_found_returns_unavailable(self):
-        """get_primary_gpu_utilization returns available=False when amd-smi is missing."""
+        """get_primary_gpu_utilization returns available=False when rocm-smi is missing."""
         amd_path = PACKAGE_ROOT / "studio" / "backend" / "utils" / "hardware" / "amd.py"
         _amd_spec = importlib.util.spec_from_file_location("test_amd3", amd_path)
         assert _amd_spec is not None and _amd_spec.loader is not None
@@ -1171,7 +1171,7 @@ class TestAmdGpuMonitoring:
         except Exception:
             pytest.skip("Could not load amd module")
 
-        with patch.object(subprocess, "run", side_effect = OSError("amd-smi not found")):
+        with patch.object(subprocess, "run", side_effect = OSError("rocm-smi not found")):
             result = amd_mod.get_primary_gpu_utilization()
         assert result["available"] is False
 
@@ -1193,7 +1193,7 @@ class TestAmdGpuMonitoring:
         with patch.object(
             subprocess,
             "run",
-            side_effect = subprocess.TimeoutExpired("amd-smi", 5),
+            side_effect = subprocess.TimeoutExpired("rocm-smi", 5),
         ):
             result = amd_mod.get_primary_gpu_utilization()
         assert result["available"] is False

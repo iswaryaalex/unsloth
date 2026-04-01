@@ -1137,10 +1137,23 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     elif [ "$RADEON" = true ]; then
         _radeon_url=$(get_radeon_wheel_url)
         if [ -n "$_radeon_url" ]; then
-            substep "installing PyTorch from Radeon repo (${_radeon_url})..."
+            substep "installing PyTorch from Radeon repo..."
+            substep "  url: ${_radeon_url}"
+            # Show any pre-existing torch before install
+            _pre_torch=$("$_VENV_PY" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "not installed")
+            substep "  torch before: ${_pre_torch}"
             run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
                 torch torchvision torchaudio \
                 --find-links "$_radeon_url"
+            # Report what was actually installed and whether HIP is active
+            _post_torch=$("$_VENV_PY" -c "
+import torch
+ver = torch.__version__
+hip = getattr(torch.version, 'hip', None) or ''
+cuda = getattr(torch.version, 'cuda', None) or ''
+print('torch', ver, '| HIP:', hip or 'none', '| CUDA:', cuda or 'none')
+" 2>/dev/null || echo "(import failed)")
+            substep "  torch after:  ${_post_torch}"
             substep "installing bitsandbytes for AMD Radeon..."
             run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" \
                 "bitsandbytes>=0.49.1"
@@ -1169,6 +1182,17 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     fi
     # Fresh: Step 2 - install unsloth, preserving pre-installed torch
     substep "installing unsloth (this may take a few minutes)..."
+    # When --radeon, record torch version before and pass --find-links so uv's
+    # solver can see the Radeon wheel and won't replace it with a PyPI build.
+    if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
+        _pre_unsloth_torch=$("$_VENV_PY" -c "
+import torch
+ver = torch.__version__
+hip = getattr(torch.version, 'hip', None) or ''
+print('torch', ver, '| HIP:', hip or 'none')
+" 2>/dev/null || echo "(not importable)")
+        substep "  torch before unsloth install: ${_pre_unsloth_torch}"
+    fi
     if [ "$SKIP_TORCH" = true ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps, then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
@@ -1184,13 +1208,37 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo
+        if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
+            run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
+                --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo \
+                --find-links "$_radeon_url"
+        else
+            run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
+                --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo
+        fi
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
     else
-        run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth "$PACKAGE_NAME"
+        if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
+            run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
+                --upgrade-package unsloth "$PACKAGE_NAME" \
+                --find-links "$_radeon_url"
+        else
+            run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
+                --upgrade-package unsloth "$PACKAGE_NAME"
+        fi
+    fi
+    if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
+        _post_unsloth_torch=$("$_VENV_PY" -c "
+import torch
+ver = torch.__version__
+hip = getattr(torch.version, 'hip', None) or ''
+print('torch', ver, '| HIP:', hip or 'none')
+" 2>/dev/null || echo "(not importable)")
+        substep "  torch after  unsloth install: ${_post_unsloth_torch}"
+        if [ "$_pre_unsloth_torch" != "$_post_unsloth_torch" ]; then
+            substep "[WARN] torch version changed during unsloth install -- Radeon wheels may have been replaced" "$C_WARN"
+        fi
     fi
 else
     # Fallback: GPU detection failed to produce a URL -- let uv resolve torch

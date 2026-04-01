@@ -1067,8 +1067,7 @@ get_radeon_wheel_url() {
     _full_ver=""
     _full_ver=$({ command -v amd-smi >/dev/null 2>&1 && \
         amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
-            'NF>1{gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]/) \
-            {print $2; ok=1; exit}} END{exit !ok}'; } || \
+            'NF>1{if(match($2,/[0-9]+\.[0-9]+\.[0-9]+/)){print substr($2,RSTART,RLENGTH); ok=1; exit}} END{exit !ok}'; } || \
         { [ -r /opt/rocm/.info/version ] && \
             awk -F'[.-]' 'NF>=3{print $1"."$2"."$3; exit}' /opt/rocm/.info/version; } || \
         { command -v hipconfig >/dev/null 2>&1 && \

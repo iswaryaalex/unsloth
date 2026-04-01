@@ -1081,42 +1081,58 @@ get_radeon_wheel_url() {
     echo "https://repo.radeon.com/rocm/manylinux/rocm-rel-${_full_ver}/"
 }
 
-# Pick the best torch wheel URL directly from the Radeon repo listing.
-# Returns the full .whl URL for the running Python (e.g. cp312) and platform,
-# or empty string on any failure.  Downloading a direct URL bypasses the risk
-# of uv's HTML parser not recognising the Apache directory listing format.
-pick_radeon_torch_wheel() {
-    _base_url="$1"   # e.g. https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/
-    # Determine the CPython tag for the running Python (e.g. cp312)
-    _pytag=$("$_VENV_PY" -c "
+# ── Radeon repo wheel selection helpers ──────────────────────────────────────
+# Fetches the Radeon repo directory listing once into _RADEON_LISTING (global).
+# _RADEON_PYTAG holds the CPython tag for the running interpreter (e.g. cp312).
+# _RADEON_BASE_URL holds the base URL for relative-href resolution.
+_RADEON_LISTING=""
+_RADEON_PYTAG=""
+_RADEON_BASE_URL=""
+
+_radeon_fetch_listing() {
+    # Usage: _radeon_fetch_listing BASE_URL
+    # Populates _RADEON_LISTING, _RADEON_PYTAG, _RADEON_BASE_URL.
+    _RADEON_BASE_URL="$1"
+    _RADEON_PYTAG=$("$_VENV_PY" -c "
 import sys
 print('cp{}{}'.format(sys.version_info.major, sys.version_info.minor))
 " 2>/dev/null) || return 1
-
-    # Fetch the directory listing
-    _listing=""
     if command -v curl >/dev/null 2>&1; then
-        _listing=$(curl -fsSL --max-time 15 "$_base_url" 2>/dev/null)
+        _RADEON_LISTING=$(curl -fsSL --max-time 20 "$_RADEON_BASE_URL" 2>/dev/null)
     elif command -v wget >/dev/null 2>&1; then
-        _listing=$(wget -qO- --timeout=15 "$_base_url" 2>/dev/null)
+        _RADEON_LISTING=$(wget -qO- --timeout=20 "$_RADEON_BASE_URL" 2>/dev/null)
     fi
-    [ -z "$_listing" ] && return 1
+    [ -n "$_RADEON_LISTING" ] || return 1
+}
 
-    # Extract href filenames for torch (not torchvision/torchaudio) matching
-    # the running Python tag and linux_x86_64, then pick the newest by sorting.
-    # Wheel name: torch-VERSION-PYTAG-PYTAG-linux_x86_64.whl
-    _wheel=$(printf '%s\n' "$_listing" \
-        | grep -o 'href="[^"]*torch-[^"]*-'"$_pytag"'-'"$_pytag"'-linux_x86_64\.whl[^"]*"' \
-        | grep -v 'torchvision\|torchaudio' \
-        | sed 's/href="//;s/".*//' \
+_pick_radeon_wheel() {
+    # Usage: _pick_radeon_wheel PACKAGE_NAME
+    # Scans $_RADEON_LISTING for the newest wheel whose filename starts exactly
+    # with PACKAGE_NAME- and matches _RADEON_PYTAG + linux_x86_64.
+    # Prints the full URL (resolving relative hrefs against _RADEON_BASE_URL).
+    _pkg="$1"
+    [ -n "$_RADEON_LISTING" ] || return 1
+    [ -n "$_RADEON_PYTAG"   ] || return 1
+    _tag="$_RADEON_PYTAG"
+    _href=$(printf '%s\n' "$_RADEON_LISTING" \
+        | grep -o 'href="[^"]*"' \
+        | sed 's/href="//;s/"//' \
+        | awk -F/ -v pkg="$_pkg" -v tag="$_tag" '
+            {
+                base = $NF
+                sub(/[?#].*/, "", base)         # strip query / fragment
+                prefix = pkg "-"
+                suffix = "-" tag "-" tag "-linux_x86_64.whl"
+                if (substr(base, 1, length(prefix)) == prefix &&
+                        substr(base, length(base) - length(suffix) + 1) == suffix)
+                    print $0
+            }' \
         | sort -V \
         | tail -1)
-    [ -z "$_wheel" ] && return 1
-
-    # If the href is a relative path, prepend the base URL
-    case "$_wheel" in
-        http*) echo "$_wheel" ;;
-        *)     echo "${_base_url%/}/$_wheel" ;;
+    [ -z "$_href" ] && return 1
+    case "$_href" in
+        http*) printf '%s\n' "$_href" ;;
+        *)     printf '%s\n' "${_RADEON_BASE_URL%/}/${_href#/}" ;;
     esac
 }
 
@@ -1181,24 +1197,39 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             # Show any pre-existing torch before install
             _pre_torch=$("$_VENV_PY" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "not installed")
             substep "  torch before: ${_pre_torch}"
-            # Prefer a direct .whl URL: fetches the Radeon repo listing, selects
-            # the best torch wheel for the running Python, and installs it directly.
-            # This avoids relying on uv's HTML parser to handle Apache directory
-            # listings, and prevents uv from preferring a higher-versioned CUDA
-            # wheel from PyPI over the ROCm wheel from the Radeon repo.
-            _torch_whl=$(pick_radeon_torch_wheel "$_radeon_url" 2>/dev/null)
-            if [ -n "$_torch_whl" ]; then
-                substep "  wheel: $(basename "$_torch_whl")"
-                run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
-                    --no-index \
-                    --find-links "$_radeon_url" \
-                    "$_torch_whl" torchvision torchaudio
+            # Fetch the Radeon repo listing once, then pick a direct wheel URL
+            # for each package.  Using direct URLs guarantees the ROCm wheel is
+            # installed rather than letting uv prefer a higher CUDA version from
+            # PyPI.  --no-index prevents any PyPI fallback; --find-links covers
+            # packages whose wheel wasn't found in the listing (falls back to
+            # picking by name from the same repo).
+            substep "  fetching Radeon repo listing..."
+            _radeon_listing_ok=false
+            if _radeon_fetch_listing "$_radeon_url" 2>/dev/null; then
+                _radeon_listing_ok=true
+            fi
+            # Pick direct wheel URLs for each package; fall back to bare name if missing
+            _torch_whl=""       ; _tv_whl=""       ; _ta_whl=""       ; _tri_whl=""
+            _torch_arg="torch"  ; _tv_arg="torchvision" ; _ta_arg="torchaudio" ; _tri_arg=""
+            if [ "$_radeon_listing_ok" = true ]; then
+                _torch_whl=$(_pick_radeon_wheel "torch"       2>/dev/null) && _torch_arg="$_torch_whl"
+                _tv_whl=$(_pick_radeon_wheel    "torchvision" 2>/dev/null) && _tv_arg="$_tv_whl"
+                _ta_whl=$(_pick_radeon_wheel    "torchaudio"  2>/dev/null) && _ta_arg="$_ta_whl"
+                _tri_whl=$(_pick_radeon_wheel   "triton"      2>/dev/null) && _tri_arg="$_tri_whl"
+            fi
+            substep "  wheels selected:"
+            substep "    torch:       $(basename "${_torch_whl:-"(not found -- using name)"}")"
+            substep "    torchvision: $(basename "${_tv_whl:-"(not found -- using name)"}")"
+            substep "    torchaudio:  $(basename "${_ta_whl:-"(not found -- using name)"}")"
+            substep "    triton:      $(basename "${_tri_whl:-"(not found -- skipping)"}")"
+            if [ -n "$_tri_arg" ]; then
+                run_install_cmd "install PyTorch + triton" uv pip install --python "$_VENV_PY" \
+                    --no-index --find-links "$_radeon_url" \
+                    "$_torch_arg" "$_tv_arg" "$_ta_arg" "$_tri_arg"
             else
-                substep "  (direct wheel pick failed; using --no-index --find-links fallback)"
                 run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
-                    --no-index \
-                    --find-links "$_radeon_url" \
-                    torch torchvision torchaudio
+                    --no-index --find-links "$_radeon_url" \
+                    "$_torch_arg" "$_tv_arg" "$_ta_arg"
             fi
             # Report what was actually installed and whether HIP is active
             _post_torch=$("$_VENV_PY" -c "

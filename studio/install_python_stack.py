@@ -772,8 +772,9 @@ def install_python_stack() -> int:
                 pip_install(
                     f"Radeon torch ({ver[0]}.{ver[1]}.{patch})",
                     "--no-cache-dir",
+                    "--no-index",  # only look at the Radeon repo; prevents uv
+                    "--find-links", radeon_url,  # picking higher CUDA wheels from PyPI
                     "torch", "torchvision", "torchaudio",
-                    "--find-links", radeon_url,
                     constrain = False,
                 )
                 pip_install(

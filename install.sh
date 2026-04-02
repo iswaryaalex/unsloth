@@ -57,10 +57,17 @@ for arg in "$@"; do
         --package) _next_is_package=true ;;
         --python) _next_is_python=true ;;
         --no-torch) _NO_TORCH_FLAG=true ;;
-        --radeon) RADEON=true ;;
         --verbose|-v) _VERBOSE=true ;;
     esac
 done
+
+# Auto-detect AMD Radeon consumer GPU via rocminfo (replaces --radeon flag).
+# Matches "Marketing Name: AMD Radeon Graphics" but not "AMD Instinct MI*".
+if [ "$RADEON" != true ] && command -v rocminfo >/dev/null 2>&1; then
+    if rocminfo 2>/dev/null | grep -q 'Marketing Name:.*Radeon'; then
+        RADEON=true
+    fi
+fi
 
 if [ "$_VERBOSE" = true ]; then
     export UNSLOTH_VERBOSE=1
@@ -1200,9 +1207,12 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             # Fetch the Radeon repo listing once, then pick a direct wheel URL
             # for each package.  Using direct URLs guarantees the ROCm wheel is
             # installed rather than letting uv prefer a higher CUDA version from
-            # PyPI.  --no-index prevents any PyPI fallback; --find-links covers
-            # packages whose wheel wasn't found in the listing (falls back to
-            # picking by name from the same repo).
+            # PyPI.  --find-links covers packages whose wheel wasn't found in
+            # the listing (falls back to picking by name from the same repo).
+            # Direct URLs returned by _pick_radeon_wheel are pinned, so uv
+            # installs exactly those wheels; transitive deps (filelock, numpy,
+            # etc.) are resolved from PyPI normally.  --no-index is NOT used
+            # because it cuts off PyPI and prevents transitive dep resolution.
             substep "  fetching Radeon repo listing..."
             _radeon_listing_ok=false
             if _radeon_fetch_listing "$_radeon_url" 2>/dev/null; then
@@ -1224,11 +1234,11 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             substep "    triton:      $(basename "${_tri_whl:-"(not found -- skipping)"}")"
             if [ -n "$_tri_arg" ]; then
                 run_install_cmd "install triton + PyTorch" uv pip install --python "$_VENV_PY" \
-                    --no-index --find-links "$_radeon_url" \
+                    --find-links "$_radeon_url" \
                     "$_tri_arg" "$_torch_arg" "$_tv_arg" "$_ta_arg"
             else
                 run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
-                    --no-index --find-links "$_radeon_url" \
+                    --find-links "$_radeon_url" \
                     "$_torch_arg" "$_tv_arg" "$_ta_arg"
             fi
             # Report what was actually installed and whether HIP is active
@@ -1244,7 +1254,7 @@ print('torch', ver, '| HIP:', hip or 'none', '| CUDA:', cuda or 'none')
             run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" \
                 "bitsandbytes>=0.49.1"
         else
-            substep "[WARN] --radeon: could not detect full ROCm version for Radeon repo; falling back to pytorch.org" "$C_WARN"
+            substep "[WARN] Radeon GPU detected but could not detect full ROCm version; falling back to pytorch.org" "$C_WARN"
             run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" "torch>=2.4,<2.11.0" "torchvision<0.26.0" "torchaudio<2.11.0" \
                 --index-url "$TORCH_INDEX_URL"
             case "$TORCH_INDEX_URL" in

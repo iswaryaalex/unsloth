@@ -38,7 +38,6 @@ PACKAGE_NAME="unsloth"
 _USER_PYTHON=""
 _NO_TORCH_FLAG=false
 _VERBOSE=false
-RADEON=false
 _next_is_package=false
 _next_is_python=false
 for arg in "$@"; do
@@ -60,14 +59,6 @@ for arg in "$@"; do
         --verbose|-v) _VERBOSE=true ;;
     esac
 done
-
-# Auto-detect AMD Radeon consumer GPU via rocminfo (replaces --radeon flag).
-# Matches "Marketing Name: AMD Radeon Graphics" but not "AMD Instinct MI*".
-if [ "$RADEON" != true ] && command -v rocminfo >/dev/null 2>&1; then
-    if rocminfo 2>/dev/null | grep -q 'Marketing Name:.*Radeon'; then
-        RADEON=true
-    fi
-fi
 
 if [ "$_VERBOSE" = true ]; then
     export UNSLOTH_VERBOSE=1
@@ -1145,6 +1136,27 @@ _pick_radeon_wheel() {
 
 TORCH_INDEX_URL=$(get_torch_index_url)
 
+# Auto-detect GPU for AMD ROCm based
+# get_torch_index_url must have chosen */rocm*
+# (gfx in rocminfo or amd-smi list). Then require rocminfo "Marketing Name:.*Radeon".
+case "$TORCH_INDEX_URL" in
+    */rocm*)
+        _amd_gpu_here=false
+        _amd_gpu_radeon=false
+        if command -v rocminfo >/dev/null 2>&1 && \
+           rocminfo 2>/dev/null | awk '/Name:[[:space:]]*gfx[0-9]/{found=1} END{exit !found}'; then
+            _amd_gpu_here=true
+        elif command -v amd-smi >/dev/null 2>&1 && \
+             amd-smi list 2>/dev/null | awk 'NR>1 && NF{found=1} END{exit !found}'; then
+            _amd_gpu_here=true
+        fi
+        if [ "$_amd_gpu_here" = true ] && command -v rocminfo >/dev/null 2>&1 && \
+           rocminfo 2>/dev/null | grep -q 'Marketing Name:.*Radeon'; then
+            _amd_gpu_radeon=true
+        fi
+        ;;
+esac
+
 # ── Print CPU-only hint when no GPU detected ──
 case "$TORCH_INDEX_URL" in
     */cpu)
@@ -1160,7 +1172,11 @@ case "$TORCH_INDEX_URL" in
         ;;
     */rocm*)
         echo ""
-        echo "  AMD ROCm detected -- installing ROCm-enabled PyTorch ($TORCH_INDEX_URL)"
+        if [ "$_amd_gpu_radeon" = true ]; then
+            echo "  AMD Radeon + ROCm detected -- installing PyTorch wheels from repo.radeon.com"
+        else
+            echo "  AMD ROCm detected -- installing ROCm-enabled PyTorch ($TORCH_INDEX_URL)"
+        fi
         echo ""
         ;;
 esac
@@ -1196,24 +1212,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
     # Fresh: Step 1 - install torch from explicit index (skip when --no-torch or Intel Mac)
     if [ "$SKIP_TORCH" = true ]; then
         substep "skipping PyTorch (--no-torch or Intel Mac x86_64)." "$C_WARN"
-    elif [ "$RADEON" = true ]; then
+    elif [ "$_amd_gpu_radeon" = true ]; then
         _radeon_url=$(get_radeon_wheel_url)
         if [ -n "$_radeon_url" ]; then
-            substep "installing PyTorch from Radeon repo..."
-            substep "  url: ${_radeon_url}"
-            # Show any pre-existing torch before install
-            _pre_torch=$("$_VENV_PY" -c "import torch; print(torch.__version__)" 2>/dev/null || echo "not installed")
-            substep "  torch before: ${_pre_torch}"
-            # Fetch the Radeon repo listing once, then pick a direct wheel URL
-            # for each package.  Using direct URLs guarantees the ROCm wheel is
-            # installed rather than letting uv prefer a higher CUDA version from
-            # PyPI.  --find-links covers packages whose wheel wasn't found in
-            # the listing (falls back to picking by name from the same repo).
-            # Direct URLs returned by _pick_radeon_wheel are pinned, so uv
-            # installs exactly those wheels; transitive deps (filelock, numpy,
-            # etc.) are resolved from PyPI normally.  --no-index is NOT used
-            # because it cuts off PyPI and prevents transitive dep resolution.
-            substep "  fetching Radeon repo listing..."
+            substep "installing PyTorch from Radeon repo(${_radeon_url})..."
             _radeon_listing_ok=false
             if _radeon_fetch_listing "$_radeon_url" 2>/dev/null; then
                 _radeon_listing_ok=true
@@ -1227,29 +1229,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 _ta_whl=$(_pick_radeon_wheel    "torchaudio"  2>/dev/null) && _ta_arg="$_ta_whl"
                 _tri_whl=$(_pick_radeon_wheel   "triton"      2>/dev/null) && _tri_arg="$_tri_whl"
             fi
-            substep "  wheels selected:"
-            substep "    torch:       $(basename "${_torch_whl:-"(not found -- using name)"}")"
-            substep "    torchvision: $(basename "${_tv_whl:-"(not found -- using name)"}")"
-            substep "    torchaudio:  $(basename "${_ta_whl:-"(not found -- using name)"}")"
-            substep "    triton:      $(basename "${_tri_whl:-"(not found -- skipping)"}")"
-            if [ -n "$_tri_arg" ]; then
-                run_install_cmd "install triton + PyTorch" uv pip install --python "$_VENV_PY" \
-                    --find-links "$_radeon_url" \
-                    "$_tri_arg" "$_torch_arg" "$_tv_arg" "$_ta_arg"
-            else
-                run_install_cmd "install PyTorch" uv pip install --python "$_VENV_PY" \
-                    --find-links "$_radeon_url" \
-                    "$_torch_arg" "$_tv_arg" "$_ta_arg"
-            fi
-            # Report what was actually installed and whether HIP is active
-            _post_torch=$("$_VENV_PY" -c "
-import torch
-ver = torch.__version__
-hip = getattr(torch.version, 'hip', None) or ''
-cuda = getattr(torch.version, 'cuda', None) or ''
-print('torch', ver, '| HIP:', hip or 'none', '| CUDA:', cuda or 'none')
-" 2>/dev/null || echo "(import failed)")
-            substep "  torch after:  ${_post_torch}"
+            run_install_cmd "install triton + PyTorch" uv pip install --python "$_VENV_PY" \
+                --find-links "$_radeon_url" \
+                "$_tri_arg" "$_torch_arg" "$_tv_arg" "$_ta_arg"
+            
             substep "installing bitsandbytes for AMD Radeon..."
             run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" \
                 "bitsandbytes>=0.49.1"
@@ -1277,18 +1260,7 @@ print('torch', ver, '| HIP:', hip or 'none', '| CUDA:', cuda or 'none')
         esac
     fi
     # Fresh: Step 2 - install unsloth, preserving pre-installed torch
-    substep "installing unsloth (this may take a few minutes)..."
-    # When --radeon, record torch version before and pass --find-links so uv's
-    # solver can see the Radeon wheel and won't replace it with a PyPI build.
-    if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
-        _pre_unsloth_torch=$("$_VENV_PY" -c "
-import torch
-ver = torch.__version__
-hip = getattr(torch.version, 'hip', None) or ''
-print('torch', ver, '| HIP:', hip or 'none')
-" 2>/dev/null || echo "(not importable)")
-        substep "  torch before unsloth install: ${_pre_unsloth_torch}"
-    fi
+    substep "installing unsloth (this may take a few minutes)..."    
     if [ "$SKIP_TORCH" = true ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps, then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
@@ -1304,37 +1276,13 @@ print('torch', ver, '| HIP:', hip or 'none')
             run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
-            run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-                --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo \
-                --find-links "$_radeon_url"
-        else
-            run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-                --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo
-        fi
+        run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
+            --upgrade-package unsloth "unsloth>=2026.3.16" unsloth-zoo
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
     else
-        if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
-            run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
-                --upgrade-package unsloth "$PACKAGE_NAME" \
-                --find-links "$_radeon_url"
-        else
-            run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
-                --upgrade-package unsloth "$PACKAGE_NAME"
-        fi
-    fi
-    if [ "$RADEON" = true ] && [ -n "$_radeon_url" ]; then
-        _post_unsloth_torch=$("$_VENV_PY" -c "
-import torch
-ver = torch.__version__
-hip = getattr(torch.version, 'hip', None) or ''
-print('torch', ver, '| HIP:', hip or 'none')
-" 2>/dev/null || echo "(not importable)")
-        substep "  torch after  unsloth install: ${_post_unsloth_torch}"
-        if [ "$_pre_unsloth_torch" != "$_post_unsloth_torch" ]; then
-            substep "[WARN] torch version changed during unsloth install -- Radeon wheels may have been replaced" "$C_WARN"
-        fi
+        run_install_cmd "install unsloth" uv pip install --python "$_VENV_PY" \
+            --upgrade-package unsloth "$PACKAGE_NAME"
     fi
 else
     # Fallback: GPU detection failed to produce a URL -- let uv resolve torch

@@ -150,6 +150,27 @@ def _has_rocm_gpu() -> bool:
     return False
 
 
+def _is_radeon_gpu() -> bool:
+    """Return True if rocminfo reports an AMD Radeon consumer GPU.
+
+    Matches 'AMD Radeon Graphics' but not 'AMD Instinct MI*' data-centre GPUs.
+    """
+    exe = shutil.which("rocminfo")
+    if not exe:
+        return False
+    try:
+        result = subprocess.run(
+            [exe],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            text = True,
+            timeout = 10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and "radeon" in result.stdout.lower()
+
+
 def _has_usable_nvidia_gpu() -> bool:
     """Return True only when nvidia-smi exists AND reports at least one GPU."""
     exe = shutil.which("nvidia-smi")
@@ -258,7 +279,7 @@ def _infer_no_torch() -> bool:
 
 
 NO_TORCH = _infer_no_torch()
-RADEON: bool = "--radeon" in sys.argv
+RADEON: bool = _is_radeon_gpu()
 
 # -- Verbosity control ----------------------------------------------------------
 # By default the installer shows a minimal progress bar (one line, in-place).
@@ -772,8 +793,7 @@ def install_python_stack() -> int:
                 pip_install(
                     f"Radeon torch ({ver[0]}.{ver[1]}.{patch})",
                     "--no-cache-dir",
-                    "--no-index",  # only look at the Radeon repo; prevents uv
-                    "--find-links", radeon_url,  # picking higher CUDA wheels from PyPI
+                    "--find-links", radeon_url,
                     "torch", "torchvision", "torchaudio",
                     constrain = False,
                 )

@@ -190,6 +190,8 @@ def test_xdna3_hands_lemond_the_archive_and_skips_flm_validate(tmp_path, monkeyp
         assert status["state"] == "ready"
         config = json.loads((backend.root / "config" / "config.json").read_text())
         assert config["flm"]["xdna3_archive"] == str(archive)
+        # FastFlowLM's own pull resolves the per-platform sources XDNA 3 models use.
+        assert backend._model_files("qwen3.6-moe:35b-a3b", backend._flm_binary()) is None
     finally:
         backend.shutdown()
 

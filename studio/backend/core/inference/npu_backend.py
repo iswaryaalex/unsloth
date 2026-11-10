@@ -650,6 +650,10 @@ class LemonadeNpuBackend:
         return sorted(models, key = lambda model: (not model.downloaded, model.id))
 
     def _model_files(self, checkpoint: str, flm_binary: Optional[Path]) -> Optional[FlmModelFiles]:
+        # XDNA 3 models come from per-platform sources (platform_sources, file_sources) that
+        # read_model_files does not model; None hands the download to FastFlowLM's own pull.
+        if self._is_xdna3():
+            return None
         return read_model_files(flm_binary, self._flm_model_dir, checkpoint)
 
     def _model(self, model_id: str) -> NpuModel:

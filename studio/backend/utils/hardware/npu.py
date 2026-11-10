@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Detects AMD XDNA 2 NPUs (1022:17f0) without starting a runtime; UNSLOTH_STUDIO_ENABLE_NPU=0 hides."""
+"""Detects AMD XDNA 2 (1022:17f0) and XDNA 3 / Medusa (1022:17f1) NPUs without starting a runtime;
+UNSLOTH_STUDIO_ENABLE_NPU=0 hides."""
 
 from __future__ import annotations
 
@@ -11,8 +12,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 _AMD_VENDOR = "1022"
-_XDNA2_DEVICE = "17f0"
-_XDNA1_DEVICE = "1502"
+_FAMILY_BY_DEVICE = {"17f0": "XDNA2", "17f1": "XDNA3", "1502": "XDNA1"}
+# XDNA3 runs a sideloaded FastFlowLM build that Lemonade installs on Windows only.
+_SUPPORTED_FAMILIES = {"XDNA2": ("linux", "win32"), "XDNA3": ("win32",)}
 _PCI_ROOT = Path("/sys/bus/pci/devices")
 _MODULE_ROOT = Path("/sys/module")
 # On unless set to a false value: the NPU section, NPU loads and the CLI's NPU ids all wait on this.
@@ -38,14 +40,14 @@ def _linux_probe(pci_root: Path = _PCI_ROOT, module_root: Path = _MODULE_ROOT) -
     for device in devices:
         vendor = (_read(device / "vendor") or "").lower().removeprefix("0x")
         product = (_read(device / "device") or "").lower().removeprefix("0x")
-        if vendor != _AMD_VENDOR or product not in (_XDNA2_DEVICE, _XDNA1_DEVICE):
+        if vendor != _AMD_VENDOR or product not in _FAMILY_BY_DEVICE:
             continue
         driver_link = device / "driver"
         driver = driver_link.resolve().name if driver_link.exists() else None
         accel = sorted((device / "accel").glob("accel*")) if (device / "accel").is_dir() else []
         return {
             "present": True,
-            "family": "XDNA2" if product == _XDNA2_DEVICE else "XDNA1",
+            "family": _FAMILY_BY_DEVICE[product],
             "name": _read(device / "vbnv") or "AMD NPU",
             "driver": driver,
             "driver_version": _read(module_root / driver / "version") if driver else None,
@@ -75,7 +77,7 @@ def _windows_probe() -> dict[str, Any]:
             if not upper.startswith(f"VEN_{_AMD_VENDOR.upper()}&DEV_"):
                 continue
             product = upper.split("&DEV_", 1)[1][:4].lower()
-            if product not in (_XDNA2_DEVICE, _XDNA1_DEVICE):
+            if product not in _FAMILY_BY_DEVICE:
                 continue
             driver_version = None
             name = None
@@ -100,7 +102,7 @@ def _windows_probe() -> dict[str, Any]:
                 name = name.rsplit(";", 1)[1]
             return {
                 "present": True,
-                "family": "XDNA2" if product == _XDNA2_DEVICE else "XDNA1",
+                "family": _FAMILY_BY_DEVICE[product],
                 "name": name or "AMD NPU",
                 "driver": "installed" if driver_version else None,
                 "driver_version": driver_version,
@@ -131,6 +133,13 @@ def detect_amd_npu() -> dict[str, Any]:
         info = {"present": False, "error": str(exc)}
     info["enabled"] = npu_enabled()
     info["supported"] = (
-        info["enabled"] and bool(info.get("present")) and info.get("family") == "XDNA2"
+        info["enabled"]
+        and bool(info.get("present"))
+        and sys.platform in _SUPPORTED_FAMILIES.get(info.get("family"), ())
     )
     return info
+
+
+def is_supported_family(family: Optional[str]) -> bool:
+    """Whether FastFlowLM can run on this NPU family on this OS, regardless of the enable flag."""
+    return sys.platform in _SUPPORTED_FAMILIES.get(family or "", ())

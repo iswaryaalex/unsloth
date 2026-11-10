@@ -159,6 +159,41 @@ def test_an_npu_left_off_is_refused_with_the_flag_named(tmp_path, monkeypatch, c
     assert backend.status()["supported"] is False
 
 
+def _xdna3_backend(tmp_path, monkeypatch):
+    installer = _Installer(_binary(tmp_path))
+    monkeypatch.setattr(nb, "_installer_module", lambda: installer)
+    monkeypatch.setattr(
+        nb,
+        "detect_amd_npu",
+        lambda: {"present": True, "supported": True, "family": "XDNA3", "driver": "installed"},
+    )
+    return installer, nb.LemonadeNpuBackend(root = tmp_path / "lemonade")
+
+
+def test_xdna3_needs_the_sideloaded_flm_before_any_download(tmp_path, monkeypatch):
+    monkeypatch.delenv(nb.XDNA3_ARCHIVE_ENV, raising = False)
+    installer, backend = _xdna3_backend(tmp_path, monkeypatch)
+    with pytest.raises(nb.NpuError, match = nb.XDNA3_ARCHIVE_ENV):
+        backend.enable()
+    assert installer.installs == 0
+
+
+def test_xdna3_hands_lemond_the_archive_and_skips_flm_validate(tmp_path, monkeypatch):
+    archive = tmp_path / "FastFlowLM-v1.0.12-win-x64.zip"
+    monkeypatch.setenv(nb.XDNA3_ARCHIVE_ENV, str(archive))
+    # flm validate only knows XDNA 2, so on XDNA 3 it reports no NPU.
+    monkeypatch.setenv("FAKE_FLM_VALIDATE", '{"ready": false, "amd_device_found": false}')
+    monkeypatch.setenv("FAKE_FLM_VERSION", "1.0.12")
+    _, backend = _xdna3_backend(tmp_path, monkeypatch)
+    try:
+        status = backend.enable()
+        assert status["state"] == "ready"
+        config = json.loads((backend.root / "config" / "config.json").read_text())
+        assert config["flm"]["xdna3_archive"] == str(archive)
+    finally:
+        backend.shutdown()
+
+
 def test_catalog_keeps_flm_chat_models_only(npu):
     npu.enable()
     ids = [model.id for model in npu.catalog()]

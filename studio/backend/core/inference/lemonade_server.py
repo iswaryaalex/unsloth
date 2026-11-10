@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -47,6 +48,15 @@ _CONFIG_OVERRIDES: dict[str, Any] = {
     "host": "127.0.0.1",
     "max_loaded_models": 1,
 }
+
+# FastFlowLM publishes no XDNA 3 (Medusa) build; a Lemonade that supports XDNA 3 installs this
+# local archive instead, via its flm.xdna3_archive setting.
+XDNA3_ARCHIVE_ENV = "UNSLOTH_FLM_XDNA3_ARCHIVE"
+
+
+def xdna3_flm_archive() -> Optional[str]:
+    value = os.environ.get(XDNA3_ARCHIVE_ENV, "").strip()
+    return value or None
 
 
 # The freed port can be taken before lemond binds it; only a collision exit is retried.
@@ -123,7 +133,11 @@ class LemonadeServer:
             config = {}
         config.update(_CONFIG_OVERRIDES)
         config["models_dir"] = str(self.cache_dir / "models")
-        config.setdefault("flm", {})["prefer_system"] = False
+        flm = config.setdefault("flm", {})
+        flm["prefer_system"] = False
+        archive = xdna3_flm_archive()
+        if archive:
+            flm["xdna3_archive"] = archive
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(config, indent = 2) + "\n", encoding = "utf-8")
         tmp.replace(path)

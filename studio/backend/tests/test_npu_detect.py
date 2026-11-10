@@ -81,6 +81,23 @@ def test_only_xdna2_is_supported(tmp_path, monkeypatch, device, supported):
     assert info["supported"] is supported
 
 
+@pytest.mark.parametrize("platform, supported", [("win32", True), ("linux", False)])
+def test_xdna3_is_supported_on_windows_only(tmp_path, monkeypatch, platform, supported):
+    _device(tmp_path, "0000:c4:00.1", "1022", "17f1", driver = "amdxdna")
+    real_probe = npu._linux_probe
+
+    def probe():
+        return real_probe(tmp_path / "devices", tmp_path / "module")
+
+    monkeypatch.setattr(npu.sys, "platform", platform)
+    monkeypatch.setattr(npu, "_linux_probe", probe)
+    monkeypatch.setattr(npu, "_windows_probe", probe)
+    monkeypatch.setenv(npu.ENABLE_ENV, "1")
+    info = npu.detect_amd_npu()
+    assert info["present"] is True and info["family"] == "XDNA3"
+    assert info["supported"] is supported
+
+
 @pytest.mark.parametrize(
     "value, enabled",
     [(None, True), ("", True), ("1", True), ("0", False), ("false", False), (" Off ", False)],

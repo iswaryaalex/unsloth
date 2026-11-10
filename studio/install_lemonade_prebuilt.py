@@ -11,10 +11,12 @@ resources/backend_versions.json for lemond's /v1/install download.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 import tempfile
@@ -32,6 +34,11 @@ from backend.utils.auth_safe import auth_safe_open  # noqa: E402
 
 PINS_PATH = Path(_STUDIO_DIR) / "lemonade_prebuilt_pins.json"
 MARKER_NAME = "UNSLOTH_LEMONADE_INFO.json"
+# A locally built lemonade-embeddable archive to install in place of the pinned release.
+LOCAL_ARCHIVE_ENV = "UNSLOTH_LEMONADE_ARCHIVE"
+_LOCAL_ARCHIVE_NAME = re.compile(
+    r"^lemonade-embeddable-(?P<version>.+)-(?:ubuntu-x64\.tar\.gz|windows-x64\.zip)$"
+)
 _CHUNK = 1 << 20
 _DOWNLOAD_TIMEOUT_S = 60
 
@@ -42,12 +49,52 @@ class LemonadeInstallCancelled(RuntimeError):
     pass
 
 
+def local_archive() -> Optional[Path]:
+    value = os.environ.get(LOCAL_ARCHIVE_ENV, "").strip()
+    return Path(value) if value else None
+
+
+@functools.lru_cache(maxsize = 8)
+def _file_sha256(path: str, mtime_ns: int, size: int) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _with_local_archive(pins: dict, archive: Path) -> dict:
+    """Pins that name the local archive, so a different archive reads as a different install."""
+    key = host_asset_key()
+    match = _LOCAL_ARCHIVE_NAME.match(archive.name)
+    if key is None or match is None:
+        raise RuntimeError(
+            f"{LOCAL_ARCHIVE_ENV} must name a lemonade-embeddable archive for this platform, "
+            f"not {archive.name}."
+        )
+    try:
+        stat = archive.stat()
+    except OSError as exc:
+        raise RuntimeError(
+            f"{LOCAL_ARCHIVE_ENV} points to {archive}, which is unreadable: {exc}"
+        ) from exc
+    asset = {
+        "name": archive.name,
+        "sha256": _file_sha256(str(archive), stat.st_mtime_ns, stat.st_size),
+        "size": stat.st_size,
+    }
+    lemonade = dict(pins["lemonade"], version = match.group("version"))
+    lemonade["assets"] = dict(pins["lemonade"]["assets"], **{key: asset})
+    return dict(pins, lemonade = lemonade)
+
+
 def load_pins(path: Path = PINS_PATH) -> dict:
     with open(path, encoding = "utf-8") as handle:
         pins = json.load(handle)
     if pins.get("schema_version") != 1:
         raise RuntimeError(f"{path} has an unsupported schema_version.")
-    return pins
+    archive = local_archive()
+    return _with_local_archive(pins, archive) if archive is not None else pins
 
 
 def host_asset_key() -> Optional[str]:
@@ -185,9 +232,17 @@ def install(
         with tempfile.TemporaryDirectory(prefix = ".lemonade-install-", dir = root) as scratch:
             scratch_dir = Path(scratch)
             archive = scratch_dir / asset["name"]
-            _download(
-                url, archive, expected_sha256 = asset["sha256"], progress = progress, cancel = cancel
-            )
+            source = local_archive()
+            if source is not None:
+                shutil.copyfile(source, archive)
+            else:
+                _download(
+                    url,
+                    archive,
+                    expected_sha256 = asset["sha256"],
+                    progress = progress,
+                    cancel = cancel,
+                )
             extracted = scratch_dir / "extracted"
             extracted.mkdir()
             core.extract_archive(archive, extracted)

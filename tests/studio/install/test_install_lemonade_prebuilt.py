@@ -158,6 +158,36 @@ def test_a_cancelled_download_installs_nothing(tmp_path, served):
     assert lp.installed_lemond(root, lp.load_pins(path)) is None
 
 
+def _local_build(tmp_path: Path, version: str) -> Path:
+    key = lp.host_asset_key()
+    built_dir = tmp_path / "ci"
+    built_dir.mkdir()
+    built = _archive(built_dir, key)
+    suffix = "windows-x64.zip" if key == "windows-x64" else "ubuntu-x64.tar.gz"
+    return built.rename(built.with_name(f"lemonade-embeddable-{version}-{suffix}"))
+
+
+def test_a_local_archive_installs_without_downloading(tmp_path, served, monkeypatch):
+    pins, httpd = served
+    local = _local_build(tmp_path, "7.7.7-medusa")
+    monkeypatch.setenv(lp.LOCAL_ARCHIVE_ENV, str(local))
+    path = pins()
+    root = tmp_path / "root"
+    binary = lp.install(root, pins_path = path)
+    assert httpd.requests == 0
+    assert lp.installed_version(binary) == "7.7.7-medusa"
+    assert binary == lp.installed_lemond(root, lp.load_pins(path))
+    versions = json.loads((binary.parent / "resources" / "backend_versions.json").read_text())
+    assert versions["flm"]["npu"] == "v1.0.3"
+
+
+def test_a_local_archive_must_be_a_lemonade_embeddable_build(tmp_path, served, monkeypatch):
+    pins, _ = served
+    monkeypatch.setenv(lp.LOCAL_ARCHIVE_ENV, str(tmp_path / "lemonade.zip"))
+    with pytest.raises(RuntimeError, match = lp.LOCAL_ARCHIVE_ENV):
+        lp.load_pins(pins())
+
+
 def test_the_shipped_pins_cover_both_npu_platforms():
     pins = lp.load_pins()
     for section in ("lemonade", "fastflowlm"):

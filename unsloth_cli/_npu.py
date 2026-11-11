@@ -82,14 +82,15 @@ def _prepare_npu_model(
         hardware = status.get("hardware") or {}
         if not hardware.get("present"):
             reason = "no AMD Ryzen AI NPU was found on this machine"
-        elif hardware.get("family") == "XDNA2" and hardware.get("enabled") is False:
+        elif hardware.get("family") in ("XDNA2", "XDNA3") and hardware.get("enabled") is False:
             reason = (
                 "the NPU is turned off in this Unsloth Studio. Restart it with "
                 "UNSLOTH_STUDIO_ENABLE_NPU=1 to use the NPU"
             )
         else:
             reason = (
-                f"{hardware.get('name') or 'this NPU'} is not supported (an XDNA2 NPU is needed)"
+                f"{hardware.get('name') or 'this NPU'} is not supported "
+                "(an XDNA2 NPU, or an XDNA3 NPU on Windows, is needed)"
             )
         raise NpuCliError(f"{model_id} runs on the AMD NPU, but {reason}.")
     if not status.get("ready"):

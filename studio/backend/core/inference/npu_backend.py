@@ -21,8 +21,13 @@ from core.inference.flm_files import (
     download_files,
     read_model_files,
 )
-from core.inference.lemonade_server import LemonadeServer, LemonadeUnavailable
-from utils.hardware.npu import detect_amd_npu
+from core.inference.lemonade_server import (
+    XDNA3_ARCHIVE_ENV,
+    LemonadeServer,
+    LemonadeUnavailable,
+    xdna3_flm_archive,
+)
+from utils.hardware.npu import detect_amd_npu, is_supported_family
 from utils.native_path_leases import child_env_without_native_path_secret
 from utils.process_lifetime import (
     adopt_pid,
@@ -431,16 +436,19 @@ class LemonadeNpuBackend:
         hardware = self.hardware()
         if not hardware.get("present"):
             raise NpuError("No AMD Ryzen AI NPU was found on this machine.")
-        if hardware.get("family") == "XDNA2" and hardware.get("enabled") is False:
+        if is_supported_family(hardware.get("family")) and hardware.get("enabled") is False:
             raise NpuError(
                 "The AMD NPU is turned off by UNSLOTH_STUDIO_ENABLE_NPU. Unset it or set it "
                 "to 1, then restart Unsloth Studio to use the NPU."
             )
         if not hardware.get("supported"):
             raise NpuError(
-                "FastFlowLM needs an XDNA 2 NPU (Ryzen AI 300/400 or Ryzen AI Max); "
-                "this NPU is XDNA 1."
+                "FastFlowLM needs an XDNA 2 NPU (Ryzen AI 300/400 or Ryzen AI Max) or, on "
+                f"Windows, an XDNA 3 NPU; this NPU is {hardware.get('family') or 'unknown'}."
             )
+
+    def _is_xdna3(self) -> bool:
+        return self.hardware().get("family") == "XDNA3"
 
     def _ensure_running(self) -> LemonadeServer:
         """Start the installed runtime if needed and return its server."""
@@ -472,6 +480,12 @@ class LemonadeNpuBackend:
     def enable(self) -> dict[str, Any]:
         """Install Lemonade and FastFlowLM, start them and validate the NPU. Idempotent."""
         self._require_supported()
+        xdna3 = self._is_xdna3()
+        if xdna3 and xdna3_flm_archive() is None:
+            raise NpuError(
+                f"FastFlowLM for XDNA 3 is not published. Set {XDNA3_ARCHIVE_ENV} to the path of "
+                "a FastFlowLM zip built for it, then restart Unsloth Studio."
+            )
         with self._lock:
             self._error = None
             (self.root / _VALIDATED_MARKER).unlink(missing_ok = True)
@@ -491,13 +505,14 @@ class LemonadeNpuBackend:
                     raise NpuError(f"Installing FastFlowLM failed: {_error_message(response)}")
                 # lemond keeps the old FastFlowLM and answers success when an update download fails.
                 expected, actual = _pinned_flm_version(), self._flm_version()
-                if expected and actual and actual != expected:
+                # XDNA 3 runs the sideloaded build, which the public FastFlowLM pin does not name.
+                if expected and actual and actual != expected and not xdna3:
                     raise NpuError(
                         f"Updating FastFlowLM to v{expected} failed; v{actual} is still installed. "
                         "Check the internet connection, then try again."
                     )
                 self._state = "validating"
-                self._validation = self._validate()
+                self._validation = self._validate_xdna3(actual) if xdna3 else self._validate()
                 if not self._validation.get("ready"):
                     raise NpuError(
                         " ".join(self._validation.get("problems") or ["NPU validation failed."])
@@ -516,6 +531,18 @@ class LemonadeNpuBackend:
                 self._error = f"Enabling the NPU runtime failed: {exc}"
                 raise NpuError(self._error) from exc
         return self.status()
+
+    def _validate_xdna3(self, flm_version: Optional[str]) -> dict[str, Any]:
+        """`flm validate` only recognizes XDNA 2 hardware, so on XDNA 3 a driver and a flm that
+        runs are the check."""
+        problems = []
+        if self._flm_binary() is None:
+            problems.append("FastFlowLM was not found after installing it.")
+        elif flm_version is None:
+            problems.append("The sideloaded FastFlowLM build did not report its version.")
+        if not self.hardware().get("driver"):
+            problems.append("The AMD NPU driver is missing.")
+        return {"ready": not problems, "problems": problems, "report": {"version": flm_version}}
 
     def _validate(self) -> dict[str, Any]:
         binary = self._flm_binary()
@@ -623,6 +650,10 @@ class LemonadeNpuBackend:
         return sorted(models, key = lambda model: (not model.downloaded, model.id))
 
     def _model_files(self, checkpoint: str, flm_binary: Optional[Path]) -> Optional[FlmModelFiles]:
+        # XDNA 3 models come from per-platform sources (platform_sources, file_sources) that
+        # read_model_files does not model; None hands the download to FastFlowLM's own pull.
+        if self._is_xdna3():
+            return None
         return read_model_files(flm_binary, self._flm_model_dir, checkpoint)
 
     def _model(self, model_id: str) -> NpuModel:
